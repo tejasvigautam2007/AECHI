@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 import logging
+from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 
@@ -136,12 +137,23 @@ def _upload_crop_to_s3(crop_b64: str, device_id: str, event_id: str) -> str:
         return ""
 
 
+def _to_decimal(val):
+    """Recursively convert float to Decimal for DynamoDB serialization."""
+    if isinstance(val, float):
+        return Decimal(str(val))
+    if isinstance(val, dict):
+        return {k: _to_decimal(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_to_decimal(v) for v in val]
+    return val
+
+
 def _store_event(enriched: dict) -> None:
     """Write enriched event to DynamoDB."""
     item = dict(enriched)
     item["pk"] = f"DEVICE#{enriched['device_id']}"
     item["sk"] = f"EVENT#{enriched['timestamp']}#{enriched['event_id']}"
-    table.put_item(Item=item)
+    table.put_item(Item=_to_decimal(item))
 
 
 def _build_eb_entry(enriched: dict) -> dict:
