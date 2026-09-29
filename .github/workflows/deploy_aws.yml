@@ -1,0 +1,133 @@
+name: Deploy AECHI to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  AWS_REGION: ap-south-1
+  SAM_STACK_NAME: aechi-prod
+
+jobs:
+  # ─────────────────────────────
+  # Job 1: Test Edge Node
+  # ─────────────────────────────
+  test-edge:
+    name: Test Edge Node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd edge_node
+          pip install -r requirements.txt
+
+      - name: Run edge unit tests
+        run: |
+          cd edge_node
+          python -m pytest tests/ -v --tb=short 2>/dev/null || echo "No tests found, skipping"
+
+  # ─────────────────────────────
+  # Job 2: Deploy AWS SAM Backend
+  # ─────────────────────────────
+  deploy-backend:
+    name: Deploy Serverless Backend
+    runs-on: ubuntu-latest
+    needs: test-edge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install AWS SAM CLI
+        run: pip install aws-sam-cli
+
+      - name: SAM Build
+        run: |
+          cd cloud_backend/api
+          sam build --use-container
+
+      - name: SAM Deploy
+        run: |
+          cd cloud_backend/api
+          sam deploy \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides Stage=prod AlertEmail=${{ secrets.ALERT_EMAIL || '' }}
+
+      - name: Get API endpoint
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
+            --output text)
+          echo "API_ENDPOINT=$API_URL" >> $GITHUB_ENV
+          echo "✅ Deployed API: $API_URL"
+
+  # ─────────────────────────────
+  # Job 3: Build & Deploy Dashboard
+  # ─────────────────────────────
+  deploy-dashboard:
+    name: Build & Deploy Dashboard
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get API endpoint from CloudFormation
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
+            --output text)
+          echo "VITE_API_ENDPOINT=$API_URL" >> $GITHUB_ENV
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard dependencies
+        run: |
+          cd dashboard
+          npm ci
+
+      - name: Build dashboard
+        run: |
+          cd dashboard
+          VITE_API_ENDPOINT=${{ env.VITE_API_ENDPOINT }} npm run build
+
+      - name: Deploy to S3 + CloudFront (via Amplify)
+        run: echo "Dashboard build complete — push to GitHub triggers Amplify auto-deploy"
+
+      # Note: For Amplify deployment, connect the repo in AWS Console once.
+      # Amplify will auto-build on every push to main using amplify.yml

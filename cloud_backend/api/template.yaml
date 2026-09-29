@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AECHI — Adaptive Edge-Cloud Hierarchical Intelligence for Urban Hazard Triage
+  Serverless backend: API Gateway + Lambda + DynamoDB + EventBridge + SNS + S3
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref HazardEventsTable
+        ALERT_TOPIC_ARN: !Ref AlertTopic
+        CROPS_BUCKET: !Ref CropsBucket
+        EVENT_BUS_NAME: !Ref HazardEventBus
+        DEDUP_WINDOW_MS: "5000"
+    Tracing: Active  # X-Ray tracing
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Description: Email address to receive HIGH severity alerts
+    Default: ""
+
+Resources:
+
+  # ─────────────────────────────────────────
+  # API Gateway
+  # ─────────────────────────────────────────
+  AECHIApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      Name: !Sub "aechi-api-${Stage}"
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Device-ID,x-api-key'"
+        AllowOrigin: "'*'"
+      Auth:
+        ApiKeyRequired: false  # Set true for production with API key
+      TracingEnabled: true
+      Tags:
+        Project: AECHI
+        Stage: !Ref Stage
+
+  # ─────────────────────────────────────────
+  # Lambda: Ingest (POST /events)
+  # ─────────────────────────────────────────
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "aechi-ingest-${Stage}"
+      CodeUri: ../lambdas/ingest/
+      Handler: handler.lambda_handler
+      Description: "Receives detection payloads from edge nodes"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HazardEventsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref HazardEventBus
+      Events:
+        PostEvents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /events
+            Method: POST
+      Tags:
+        Project: AECHI
+
+  # ─────────────────────────────────────────
+  # Lambda: Triage (EventBridge triggered)
+  # ─────────────────────────────────────────
+  TriageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "aechi-triage-${Stage}"
+      CodeUri: ../lambdas/triage/
+      Handler: handler.lambda_handler
+      Description: "Severity scoring, dedup, and alert routing"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HazardEventsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+      Events:
+        HazardDetectionRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref HazardEventBus
+            Pattern:
+              source:
+                - "aechi.edge"
+              detail-type:
+                - "HazardDetection"
+      Tags:
+        Project: AECHI
+
+  # ─────────────────────────────────────────
+  # Lambda: Alert (SNS triggered)
+  # ─────────────────────────────────────────
+  AlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "aechi-alert-${Stage}"
+      CodeUri: ../lambdas/alert/
+      Handler: handler.lambda_handler
+      Description: "Processes SNS alerts and logs to DynamoDB"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HazardEventsTable
+      Events:
+        AlertSNS:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlertTopic
+      Tags:
+        Project: AECHI
+
+  # ─────────────────────────────────────────
+  # Lambda: Dashboard API (GET /dashboard)
+  # ─────────────────────────────────────────
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "aechi-dashboard-${Stage}"
+      CodeUri: ../lambdas/dashboard/
+      Handler: handler.lambda_handler
+      Description: "Serves recent events and alerts to the React dashboard"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref HazardEventsTable
+      Events:
+        GetEvents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /dashboard/events
+            Method: GET
+        GetAlerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /dashboard/alerts
+            Method: GET
+        GetStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /dashboard/stats
+            Method: GET
+      Tags:
+        Project: AECHI
+
+  # ─────────────────────────────────────────
+  # DynamoDB Table
+  # ─────────────────────────────────────────
+  HazardEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "aechi-events-${Stage}"
+      BillingMode: PAY_PER_REQUEST  # Serverless — no capacity planning needed
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: ingested_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: severity-time-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: ingested_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES  # For real-time dashboard
+      Tags:
+        - Key: Project
+          Value: AECHI
+
+  # ─────────────────────────────────────────
+  # EventBridge Custom Bus
+  # ─────────────────────────────────────────
+  HazardEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "aechi-hazard-bus-${Stage}"
+
+  # ─────────────────────────────────────────
+  # SNS Alert Topic
+  # ─────────────────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "aechi-alerts-${Stage}"
+      DisplayName: "AECHI Hazard Alerts"
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ─────────────────────────────────────────
+  # S3 Bucket for Anonymized Crops Archive
+  # ─────────────────────────────────────────
+  CropsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "aechi-crops-${Stage}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCrops
+            Status: Enabled
+            ExpirationInDays: 30  # Auto-delete crops after 30 days
+
+  # ─────────────────────────────────────────
+  # CloudWatch Dashboard
+  # ─────────────────────────────────────────
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "AECHI-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IngestFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${TriageFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AlertFunction}"]
+                ],
+                "period": 60,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IngestFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${TriageFunction}"]
+                ],
+                "period": 60,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL — use this in edge node --endpoint flag"
+    Value: !Sub "https://${AECHIApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "AECHI-ApiEndpoint-${Stage}"
+
+  DynamoDBTable:
+    Description: "DynamoDB table name"
+    Value: !Ref HazardEventsTable
+    Export:
+      Name: !Sub "AECHI-DynamoTable-${Stage}"
+
+  AlertTopicArn:
+    Description: "SNS Alert Topic ARN"
+    Value: !Ref AlertTopic
+
+  CropsBucket:
+    Description: "S3 bucket for anonymized crops"
+    Value: !Ref CropsBucket

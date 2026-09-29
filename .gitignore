@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# YOLOv8 model weights (auto-downloaded, don't commit)
+*.pt
+*.onnx
+
+# Node / React
+node_modules/
+dashboard/dist/
+dashboard/.env
+dashboard/.env.local
+
+# AWS SAM build artifacts
+cloud_backend/api/.aws-sam/
+samconfig.toml
+
+# Secrets & credentials
+.env
+*.env
+*.pem
+*.key
+aws-exports.js
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Demo videos (large files)
+demo/*.mp4
+demo/*.avi
+demo/*.mkv
