@@ -297,6 +297,7 @@ Resources:
               "type": "metric",
               "properties": {
                 "title": "Lambda Invocations",
+                "region": "${AWS::Region}",
                 "metrics": [
                   ["AWS/Lambda", "Invocations", "FunctionName", "${IngestFunction}"],
                   ["AWS/Lambda", "Invocations", "FunctionName", "${TriageFunction}"],
@@ -311,6 +312,7 @@ Resources:
               "type": "metric",
               "properties": {
                 "title": "Lambda Errors",
+                "region": "${AWS::Region}",
                 "metrics": [
                   ["AWS/Lambda", "Errors", "FunctionName", "${IngestFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${TriageFunction}"],
