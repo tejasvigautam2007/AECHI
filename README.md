@@ -1,155 +1,173 @@
-# AECHI — Adaptive Edge-Cloud Hierarchical Intelligence for Urban Hazard Triage
+# AECHI - Adaptive Edge-Cloud Hierarchical Intelligence for Urban Hazard Triage
 
 > **Dynamic Cascading Inference with Zero-Trust Local Anonymization**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://python.org)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
 [![AWS Serverless](https://img.shields.io/badge/AWS-Serverless-orange.svg)](https://aws.amazon.com/serverless/)
+[![Vite + React](https://img.shields.io/badge/Dashboard-React_18_%2B_Vite-61dafb.svg)](dashboard)
 
 ---
 
-## 🎯 Problem Statement
+## 🚨 Problem Statement
 
-Modern urban IoT deployments face three critical bottlenecks:
+Modern metropolitan IoT deployments face three critical bottlenecks:
 
-| Problem | Industry Reality | AECHI Solution |
+| Bottleneck | Industry Reality | AECHI Solution |
 |---|---|---|
-| **Network Congestion** | Edge cameras can't stream HD video 24/7 | Run lightweight inference locally, only upload metadata + anonymized crops |
-| **Compute Constraints** | Low-power edge nodes can't run large CV models continuously | Cascading model pipeline: nano→small→medium triggered by confidence thresholds |
-| **Data Privacy (GDPR/DPDP)** | Raw faces & license plates violate compliance | Zero-trust anonymization at edge before any data leaves the node |
+| **Network Congestion** | Continuous 1080p/4K streaming exhausts backhaul bandwidth | 3-tier lightweight inference runs at the edge; only compact telemetry + anonymized $128 \times 128$ evidence crops are uploaded. |
+| **Compute & Power Caps** | Edge devices cannot sustain heavy vision models continuously | **Dynamic Cascading Pipeline**: `nano` (~2.5ms) → `small` (~8ms) → `medium` (~25ms), dynamically escalated based on confidence thresholds. |
+| **Data Privacy (GDPR / DPDP)** | Streaming unredacted faces and license plates violates compliance | **Zero-Trust Edge Anonymization**: Faces blurred (MediaPipe/Haar) and plates blackened before any network transmission. |
 
 ---
 
-## 🏗️ System Architecture
+## 🏛️ System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        EDGE NODE (RPi / Jetson Nano)            │
-│                                                                  │
-│  Camera Feed → YOLOv8-nano (always-on, low-power)               │
-│                    │                                             │
-│           confidence < 0.6?                                      │
-│                    │ YES → YOLOv8-small (escalate)              │
-│                    │         │                                   │
-│                    │  still < 0.75? → YOLOv8-medium (final)    │
-│                    │                                             │
-│  Detected Objects → Anonymizer (blur faces, redact plates)      │
-│                    │                                             │
-│  Payload: {timestamp, class, confidence, bbox, anon_crop_b64}  │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ HTTPS (mTLS)
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    AWS SERVERLESS BACKEND                        │
-│                                                                  │
-│  API Gateway → Lambda: ingest  → DynamoDB (raw events)         │
-│                    │                                             │
-│               EventBridge → Lambda: triage                      │
-│                    │  (severity scoring, dedup, geo-cluster)    │
-│                    │                                             │
-│               SNS → Lambda: alert (PagerDuty / email)          │
-│                    │                                             │
-│               S3 (anonymized crops archive)                     │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ WebSocket / REST
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               LIVE DASHBOARD (React + AWS Amplify)               │
-│  Real-time hazard map · Severity heatmap · Alert feed · Stats  │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         EDGE NODE (RPi / Jetson / PC)                         │
+│                                                                               │
+│  Camera Feed ──> YOLOv8-nano (always-on, low-power baseline)                  │
+│                        │                                                      │
+│                 conf < 0.60?                                                  │
+│                        │ YES ──> YOLOv8-small (tier 1 escalation)             │
+│                        │               │                                      │
+│                        │        still < 0.75? ──> YOLOv8-medium (tier 2 final)│
+│                        │               │                 │                    │
+│                        ▼               ▼                 ▼                    │
+│                 Zero-Trust Anonymizer (Face Blur + Plate Redaction)           │
+│                        │                                                      │
+│                        ▼                                                      │
+│                 Authenticated Uploader (mTLS X.509 / HTTPS + Geo-Tagging)     │
+└────────────────────────┼──────────────────────────────────────────────────────┘
+                         │ HTTPS / mTLS
+                         ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            AWS SERVERLESS BACKEND                             │
+│                                                                               │
+│  API Gateway ──> Lambda: Ingest ──┬──> Amazon S3 (Anonymized Crops Archive)   │
+│                                   └──> DynamoDB (Raw Telemetry + 7d TTL)      │
+│                                                  │                            │
+│                                          EventBridge Bus                      │
+│                                                  │                            │
+│                                                  ▼                            │
+│                                          Lambda: Triage                       │
+│                               (Deduplication + Spatial Geo-Clustering)        │
+│                                                  │                            │
+│                                                  ▼                            │
+│                                          Amazon SNS Topic                     │
+│                                                  │                            │
+│                                                  ▼                            │
+│                                          Lambda: Alert                        │
+│                               (Slack/PagerDuty Webhook + SES Email)           │
+└────────────────────────┼──────────────────────────────────────────────────────┘
+                         │ REST / Polling Stream
+                         ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      TACTICAL COMMAND CENTER DASHBOARD                        │
+│   • Live Urban GIS Map       • Multi-Camera Incident Clusters                 │
+│   • Threat Breakdown Charts  • Edge Fleet & Threshold Tuning                  │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📂 Repository Structure
+## 📁 Repository Structure
 
 ```
 AECHI/
-├── edge_node/               # Runs on Raspberry Pi / Jetson Nano / any PC (simulation mode)
-│   ├── main.py              # Entry point: camera loop + cascading inference
-│   ├── cascading_pipeline.py# YOLOv8 nano→small→medium cascade logic
-│   ├── anonymizer/          # Zero-trust face blur + license plate redaction
-│   │   ├── face_blur.py
-│   │   └── plate_redact.py
-│   ├── uploader.py          # mTLS HTTPS payload sender
-│   ├── simulate.py          # Simulation mode (no camera required, uses video files)
-│   └── requirements.txt
+├── edge_node/                  # Edge device runtime
+│   ├── main.py                 # Live camera loop + cascade + anonymizer
+│   ├── cascading_pipeline.py   # 3-tier YOLO cascade (nano -> small -> medium)
+│   ├── anonymizer/             # Zero-trust privacy module
+│   │   ├── face_blur.py        # MediaPipe / Haar cascade face blur
+│   │   └── plate_redact.py     # Contour morphology + aspect ratio redaction
+│   ├── uploader.py             # mTLS / authenticated payload uploader
+│   ├── simulate.py             # Multi-node urban fleet simulator
+│   ├── requirements.txt        # Python dependencies
+│   └── tests/                  # Unit test suite
+│       ├── test_cascading.py
+│       ├── test_anonymizer.py
+│       └── test_uploader.py
 │
-├── cloud_backend/           # AWS Serverless
-│   ├── lambdas/
-│   │   ├── ingest/          # Lambda: receives edge payloads
-│   │   ├── triage/          # Lambda: severity scoring + dedup
-│   │   └── alert/           # Lambda: SNS alerting
+├── cloud_backend/              # AWS Serverless SAM Backend
 │   ├── api/
-│   │   └── template.yaml    # SAM template (API Gateway + Lambdas + DynamoDB + S3)
-│   └── requirements.txt
+│   │   └── template.yaml       # SAM template (API Gateway, Lambdas, DynamoDB, S3)
+│   ├── lambdas/
+│   │   ├── ingest/             # S3 crop persistence + DynamoDB storage
+│   │   ├── triage/             # Spatial-temporal geo-clustering + scoring
+│   │   ├── alert/              # Webhook (Slack/PagerDuty) + SES notifications
+│   │   └── dashboard/          # Serves incidents, events, map GIS, and stats
+│   ├── requirements.txt
+│   └── tests/
+│       └── test_lambdas.py     # Lambda unit tests with mocked AWS SDK
 │
-├── dashboard/               # React live dashboard
+├── dashboard/                  # React 18 + Vite + Tailwind Tactical UI
 │   ├── src/
-│   │   ├── components/      # HazardMap, AlertFeed, SeverityGauge, StatsBar
-│   │   └── pages/           # Home, Analytics, Config
+│   │   ├── components/         # HazardMap, IncidentsView, FleetConfigView, etc.
+│   │   ├── api.js              # API client with offline fallback support
+│   │   └── App.jsx             # Multi-view command center
 │   ├── package.json
-│   └── amplify.yml
+│   └── amplify.yml             # AWS Amplify hosting configuration
 │
-├── infra/
-│   ├── cloudformation/      # CloudFormation stacks
-│   └── terraform/           # Terraform alternative
+├── infra/                      # Infrastructure as Code (IaC)
+│   └── terraform/              # Terraform alternative deployment
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
 │
-├── .github/
-│   └── workflows/
-│       ├── edge_tests.yml   # CI: edge node unit tests
-│       └── deploy_aws.yml   # CD: SAM deploy to AWS on push to main
-│
-├── docs/
+├── docs/                       # Architecture specifications
 │   └── architecture.md
-└── demo/                    # Sample video files for simulation mode
+├── demo/                       # Local demo assets & video generators
+│   └── generate_sample_video.py
+├── LICENSE                     # MIT License
+└── .github/
+    └── workflows/
+        └── deploy_aws.yml      # CI/CD: Automated testing + SAM deploy
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start Guide
 
-### 1. Edge Node (Simulation Mode — no camera needed)
+### 1. Run Edge Node Unit Tests
 ```bash
 cd edge_node
-pip install -r requirements.txt
-# Download YOLOv8 weights automatically on first run
-python simulate.py --video demo/sample_urban.mp4 --endpoint https://<your-api-gw>.amazonaws.com/prod
+python -m unittest discover tests -v
 ```
 
-### 2. Deploy AWS Backend
+### 2. Launch Urban Fleet Simulation (No Hardware Needed)
+Simulate 3 distributed camera nodes transmitting real-time hazards with geo-coordinates:
+```bash
+cd edge_node
+python simulate.py --fleet --nodes 3 --endpoint https://<your-api-gateway-url>.amazonaws.com/prod
+```
+
+### 3. Deploy Serverless Backend to AWS
 ```bash
 cd cloud_backend/api
 sam build
 sam deploy --guided
 ```
 
-### 3. Dashboard
+### 4. Launch Tactical Dashboard
 ```bash
 cd dashboard
 npm install
-npm run dev          # local dev
-# OR: push to GitHub → auto-deploys via AWS Amplify
+npm run dev
 ```
+Open [http://localhost:5173](http://localhost:5173) in your browser. If no AWS backend is deployed, the dashboard automatically initializes with rich interactive demo telemetry.
 
 ---
 
-## 🔑 Key Technical Features
+## 🔒 Security & Privacy Guarantee
 
-- **Cascading Inference**: 3-tier model escalation (nano 2ms → small 8ms → medium 25ms avg latency)
-- **Zero-Trust Anonymization**: Faces blurred with MediaPipe, plates redacted with OpenCV regex-OCR — *before* any network call
-- **Serverless Scaling**: API Gateway + Lambda scales from 0 to 10,000 events/sec automatically
-- **Real-Time Dashboard**: WebSocket push from DynamoDB Streams → API Gateway WS → React
-- **Privacy-First Payload**: Only metadata + anonymized crops leave the edge node
-
----
-
-## 👨‍💻 Team
-
-Built for academic evaluation — Edge AI + Serverless Cloud integration project.
+* **Edge Anonymization**: All faces and license plates are permanently obscured using Gaussian blur and morphological blackout **prior** to network transmission.
+* **Encrypted Uplink**: Mutual TLS (mTLS) with X.509 client certificate authentication ensures only authorized edge devices can push data to API Gateway.
+* **Data Minimization**: Raw video streams never leave the edge; only structured metadata and $128 \times 128$ anonymized evidence crops are stored with automated 7-day DynamoDB TTL and 30-day S3 expiration.
 
 ---
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE) for details.

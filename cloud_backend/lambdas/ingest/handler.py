@@ -1,10 +1,11 @@
 """
 Lambda: ingest
 Receives detection event batches from edge nodes via API Gateway.
-Validates, enriches, and writes to DynamoDB.
-Publishes to EventBridge for downstream triage processing.
+Validates, stores evidence crops to S3, writes metadata to DynamoDB,
+and publishes to EventBridge for downstream triage processing.
 """
 
+import base64
 import json
 import os
 import time
@@ -18,8 +19,9 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource("dynamodb")
 eventbridge = boto3.client("events")
+s3 = boto3.client("s3")
 
-TABLE_NAME = os.environ["DYNAMODB_TABLE"]
+TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "aechi-events-prod")
 EVENT_BUS_NAME = os.environ.get("EVENT_BUS_NAME", "default")
 S3_BUCKET = os.environ.get("CROPS_BUCKET", "")
 
@@ -51,11 +53,23 @@ def lambda_handler(event, context):
     for raw in raw_events:
         try:
             enriched = _enrich_event(raw, device_id)
+
+            # Upload evidence crop to S3 if present
+            crop_b64 = raw.get("anon_crop_b64")
+            crop_s3_key = None
+            if crop_b64 and S3_BUCKET:
+                crop_s3_key = _upload_crop_to_s3(
+                    crop_b64=crop_b64,
+                    device_id=enriched["device_id"],
+                    event_id=enriched["event_id"]
+                )
+                enriched["crop_s3_key"] = crop_s3_key
+
             _store_event(enriched)
             stored_ids.append(enriched["event_id"])
             eb_entries.append(_build_eb_entry(enriched))
         except Exception as e:
-            logger.error(f"Failed to process event: {e} | raw={raw}")
+            logger.error(f"Failed to process event: {e} | raw={raw}", exc_info=True)
 
     # Publish to EventBridge in batches of 10 (AWS limit)
     for i in range(0, len(eb_entries), 10):
@@ -84,25 +98,47 @@ def _enrich_event(raw: dict, device_id: str) -> dict:
     if missing:
         raise ValueError(f"Missing fields: {missing}")
 
+    event_id = str(uuid.uuid4())
     return {
-        "event_id": str(uuid.uuid4()),
-        "device_id": raw.get("device_id", device_id),
+        "event_id": event_id,
+        "device_id": str(raw.get("device_id", device_id)),
         "timestamp": int(raw["timestamp"]),
         "ingested_at": int(time.time() * 1000),
         "class_label": str(raw["class_label"]),
         "confidence": float(raw["confidence"]),
         "bbox": raw.get("bbox", []),
-        "model_tier": raw.get("model_tier", "unknown"),
+        "model_tier": str(raw.get("model_tier", "unknown")),
         "inference_ms": float(raw.get("inference_ms", 0)),
-        "severity": str(raw["severity"]),
-        "anon_crop_b64": raw.get("anon_crop_b64", ""),
+        "severity": str(raw["severity"]).upper(),
+        "lat": float(raw.get("lat", 0.0)),
+        "lon": float(raw.get("lon", 0.0)),
+        "status": "pending_triage",
         "ttl": int(time.time()) + (7 * 24 * 3600),  # 7-day TTL
     }
 
 
+def _upload_crop_to_s3(crop_b64: str, device_id: str, event_id: str) -> str:
+    """Decode base64 crop and persist in S3 Crops bucket."""
+    s3_key = f"crops/{device_id}/{event_id}.jpg"
+    try:
+        image_bytes = base64.b64decode(crop_b64)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=image_bytes,
+            ContentType="image/jpeg",
+            Metadata={"device_id": device_id, "event_id": event_id}
+        )
+        logger.info(f"Persisted evidence crop to s3://{S3_BUCKET}/{s3_key}")
+        return s3_key
+    except Exception as e:
+        logger.error(f"S3 crop upload error: {e}")
+        return ""
+
+
 def _store_event(enriched: dict) -> None:
-    """Write enriched event to DynamoDB (strip large b64 crop for main table)."""
-    item = {k: v for k, v in enriched.items() if k != "anon_crop_b64"}
+    """Write enriched event to DynamoDB."""
+    item = dict(enriched)
     item["pk"] = f"DEVICE#{enriched['device_id']}"
     item["sk"] = f"EVENT#{enriched['timestamp']}#{enriched['event_id']}"
     table.put_item(Item=item)
@@ -120,6 +156,9 @@ def _build_eb_entry(enriched: dict) -> dict:
             "severity": enriched["severity"],
             "confidence": enriched["confidence"],
             "timestamp": enriched["timestamp"],
+            "lat": enriched.get("lat", 0.0),
+            "lon": enriched.get("lon", 0.0),
+            "crop_s3_key": enriched.get("crop_s3_key", ""),
         }),
         "EventBusName": EVENT_BUS_NAME,
     }
@@ -131,6 +170,8 @@ def _response(status_code: int, body: dict) -> dict:
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,X-Device-ID,x-api-key",
+            "Access-Control-Allow-Methods": "POST,OPTIONS",
         },
         "body": json.dumps(body),
     }

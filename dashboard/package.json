@@ -1,6 +1,7 @@
 {
   "name": "aechi-dashboard",
   "version": "1.0.0",
+  "type": "module",
   "description": "AECHI Live Hazard Triage Dashboard",
   "scripts": {
     "dev": "vite",

@@ -15,8 +15,9 @@ Globals:
         ALERT_TOPIC_ARN: !Ref AlertTopic
         CROPS_BUCKET: !Ref CropsBucket
         EVENT_BUS_NAME: !Ref HazardEventBus
-        DEDUP_WINDOW_MS: "5000"
-    Tracing: Active  # X-Ray tracing
+        DEDUP_WINDOW_SEC: "5"
+        GEO_CLUSTER_RADIUS_METERS: "150.0"
+    Tracing: Active
 
 Parameters:
   Stage:
@@ -26,6 +27,14 @@ Parameters:
   AlertEmail:
     Type: String
     Description: Email address to receive HIGH severity alerts
+    Default: ""
+  WebhookUrl:
+    Type: String
+    Description: Slack or PagerDuty webhook URL for dispatching high-severity alerts
+    Default: ""
+  SesSenderEmail:
+    Type: String
+    Description: Verified SES email identity for sending alerts
     Default: ""
 
 Resources:
@@ -43,7 +52,7 @@ Resources:
         AllowHeaders: "'Content-Type,X-Device-ID,x-api-key'"
         AllowOrigin: "'*'"
       Auth:
-        ApiKeyRequired: false  # Set true for production with API key
+        ApiKeyRequired: false
       TracingEnabled: true
       Tags:
         Project: AECHI
@@ -58,12 +67,14 @@ Resources:
       FunctionName: !Sub "aechi-ingest-${Stage}"
       CodeUri: ../lambdas/ingest/
       Handler: handler.lambda_handler
-      Description: "Receives detection payloads from edge nodes"
+      Description: "Receives detection payloads from edge nodes and persists crops"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref HazardEventsTable
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref HazardEventBus
+        - S3WritePolicy:
+            BucketName: !Ref CropsBucket
       Events:
         PostEvents:
           Type: Api
@@ -83,7 +94,7 @@ Resources:
       FunctionName: !Sub "aechi-triage-${Stage}"
       CodeUri: ../lambdas/triage/
       Handler: handler.lambda_handler
-      Description: "Severity scoring, dedup, and alert routing"
+      Description: "Severity scoring, geo-clustering, and multi-node correlation"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref HazardEventsTable
@@ -111,10 +122,21 @@ Resources:
       FunctionName: !Sub "aechi-alert-${Stage}"
       CodeUri: ../lambdas/alert/
       Handler: handler.lambda_handler
-      Description: "Processes SNS alerts and logs to DynamoDB"
+      Description: "Dispatches alerts to Webhook, SES Email, and DynamoDB"
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref WebhookUrl
+          ALERT_EMAIL: !Ref AlertEmail
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref HazardEventsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
       Events:
         AlertSNS:
           Type: SNS
@@ -124,7 +146,7 @@ Resources:
         Project: AECHI
 
   # ─────────────────────────────────────────
-  # Lambda: Dashboard API (GET /dashboard)
+  # Lambda: Dashboard API (GET /dashboard/*)
   # ─────────────────────────────────────────
   DashboardFunction:
     Type: AWS::Serverless::Function
@@ -132,10 +154,12 @@ Resources:
       FunctionName: !Sub "aechi-dashboard-${Stage}"
       CodeUri: ../lambdas/dashboard/
       Handler: handler.lambda_handler
-      Description: "Serves recent events and alerts to the React dashboard"
+      Description: "Serves events, alerts, stats, map GIS data, and incidents"
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref HazardEventsTable
+        - S3ReadPolicy:
+            BucketName: !Ref CropsBucket
       Events:
         GetEvents:
           Type: Api
@@ -155,6 +179,18 @@ Resources:
             RestApiId: !Ref AECHIApi
             Path: /dashboard/stats
             Method: GET
+        GetIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /dashboard/incidents
+            Method: GET
+        GetMapEvents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AECHIApi
+            Path: /dashboard/map-events
+            Method: GET
       Tags:
         Project: AECHI
 
@@ -165,7 +201,7 @@ Resources:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub "aechi-events-${Stage}"
-      BillingMode: PAY_PER_REQUEST  # Serverless — no capacity planning needed
+      BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: pk
           AttributeType: S
@@ -193,7 +229,7 @@ Resources:
         AttributeName: ttl
         Enabled: true
       StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES  # For real-time dashboard
+        StreamViewType: NEW_AND_OLD_IMAGES
       Tags:
         - Key: Project
           Value: AECHI
@@ -235,11 +271,17 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
       LifecycleConfiguration:
         Rules:
           - Id: DeleteOldCrops
             Status: Enabled
-            ExpirationInDays: 30  # Auto-delete crops after 30 days
+            ExpirationInDays: 30
 
   # ─────────────────────────────────────────
   # CloudWatch Dashboard
@@ -258,7 +300,8 @@ Resources:
                 "metrics": [
                   ["AWS/Lambda", "Invocations", "FunctionName", "${IngestFunction}"],
                   ["AWS/Lambda", "Invocations", "FunctionName", "${TriageFunction}"],
-                  ["AWS/Lambda", "Invocations", "FunctionName", "${AlertFunction}"]
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AlertFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DashboardFunction}"]
                 ],
                 "period": 60,
                 "stat": "Sum"
@@ -270,7 +313,8 @@ Resources:
                 "title": "Lambda Errors",
                 "metrics": [
                   ["AWS/Lambda", "Errors", "FunctionName", "${IngestFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${TriageFunction}"]
+                  ["AWS/Lambda", "Errors", "FunctionName", "${TriageFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AlertFunction}"]
                 ],
                 "period": 60,
                 "stat": "Sum"
